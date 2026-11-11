@@ -1,10 +1,6 @@
 
 @import "tailwindcss";
 
-:root {
-  color-scheme: light;
-}
-
 * {
   box-sizing: border-box;
 }
@@ -15,10 +11,14 @@ html {
 
 body {
   margin: 0;
+  -webkit-font-smoothing: antialiased;
+}
+
+.theme-shell {
+  min-height: 100vh;
   background: var(--color-background);
   color: var(--color-foreground);
   font-family: var(--font-body);
-  -webkit-font-smoothing: antialiased;
   transition:
     background-color 250ms ease,
     color 250ms ease;

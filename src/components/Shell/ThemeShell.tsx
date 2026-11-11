@@ -23,10 +23,8 @@ export default function ThemeShell({
     "--color-on-primary": selectedTheme.colors.onPrimary,
     "--color-accent": selectedTheme.colors.accent,
     "--color-border": selectedTheme.colors.border,
-
     "--font-display": selectedTheme.fonts.display,
     "--font-body": selectedTheme.fonts.body,
-
     colorScheme: theme === "luxury" ? "dark" : "light",
   } as CSSProperties;
 
@@ -34,7 +32,7 @@ export default function ThemeShell({
     <div
       data-theme={theme}
       style={themeStyles}
-      className="min-h-screen"
+      className="theme-shell"
     >
       {children}
     </div>
