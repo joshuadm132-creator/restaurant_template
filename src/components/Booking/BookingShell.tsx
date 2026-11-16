@@ -17,6 +17,8 @@ import { supabase } from "@/lib/supabase/client";
 
 type TableStatus = "available" | "held" | "reserved";
 
+type BookingStep = "details" | "tables" | "customer" | "confirmation";
+
 interface RestaurantTable {
   id: string;
   code: string;
@@ -51,6 +53,11 @@ interface AvailabilityRow {
   status: TableStatus;
 }
 
+interface HoldRow {
+  reservation_id: string;
+  hold_expires_at: string;
+}
+
 interface BookingShellProps {
   theme: ThemeName;
 }
@@ -58,10 +65,6 @@ interface BookingShellProps {
 // =============================================================================
 // Timezone helper
 // =============================================================================
-
-// Converts a restaurant-local date and time into a UTC ISO timestamp.
-// This ensures the selected time is interpreted in the restaurant's timezone,
-// not necessarily the customer's browser timezone.
 
 function restaurantDateTimeToISO(
   date: string,
@@ -92,11 +95,8 @@ function restaurantDateTimeToISO(
     hourCycle: "h23",
   });
 
-  // Adjust the UTC timestamp until its restaurant-local representation
-  // matches the date and time selected by the customer.
   for (let i = 0; i < 4; i++) {
     const parts = formatter.formatToParts(new Date(utcTimestamp));
-
     const values = Object.fromEntries(
       parts.map((part) => [part.type, part.value])
     );
@@ -117,9 +117,7 @@ function restaurantDateTimeToISO(
     if (difference === 0) break;
   }
 
-  // Verify that the selected local time actually exists.
   const finalParts = formatter.formatToParts(new Date(utcTimestamp));
-
   const finalValues = Object.fromEntries(
     finalParts.map((part) => [part.type, part.value])
   );
@@ -145,7 +143,7 @@ function restaurantDateTimeToISO(
 // =============================================================================
 
 export default function BookingShell({ theme }: BookingShellProps) {
-  const [step, setStep] = useState<"details" | "tables">("details");
+  const [step, setStep] = useState<BookingStep>("details");
 
   const [selectedTableIds, setSelectedTableIds] = useState<string[]>([]);
 
@@ -153,6 +151,13 @@ export default function BookingShell({ theme }: BookingShellProps) {
     date: "",
     time: "",
     guests: "2",
+  });
+
+  const [customerDetails, setCustomerDetails] = useState({
+    name: "",
+    phone: "",
+    email: "",
+    notes: "",
   });
 
   const [restaurant, setRestaurant] =
@@ -164,13 +169,22 @@ export default function BookingShell({ theme }: BookingShellProps) {
 
   const [loading, setLoading] = useState(true);
   const [availabilityLoading, setAvailabilityLoading] = useState(false);
+  const [creatingHold, setCreatingHold] = useState(false);
 
   const [error, setError] = useState<string | null>(null);
   const [availabilityError, setAvailabilityError] = useState<string | null>(
     null
   );
+  const [bookingError, setBookingError] = useState<string | null>(null);
 
   const [availabilityRetry, setAvailabilityRetry] = useState(0);
+
+  const [hold, setHold] = useState<{
+    reservationId: string;
+    expiresAt: string;
+  } | null>(null);
+
+  const [remainingSeconds, setRemainingSeconds] = useState(0);
 
   const isLuxury = theme === "luxury";
   const bookingMethod = restaurantConfig.booking.method;
@@ -214,7 +228,6 @@ export default function BookingShell({ theme }: BookingShellProps) {
           throw new Error("This restaurant could not be found.");
         }
 
-        // Load active tables and their combination relationships.
         const [
           { data: tableRows, error: tablesError },
           { data: combinationRows, error: combinationsError },
@@ -265,8 +278,6 @@ export default function BookingShell({ theme }: BookingShellProps) {
               .filter((combination) => combination.table_id === table.id)
               .map((combination) => combination.compatible_table_id),
 
-            // The actual status will be retrieved when a date and time
-            // have been selected.
             status: "available",
           })
         );
@@ -350,7 +361,6 @@ export default function BookingShell({ theme }: BookingShellProps) {
         if (rpcError) throw rpcError;
 
         const rows = (data ?? []) as AvailabilityRow[];
-
         const newAvailability: Record<string, TableStatus> = {};
 
         for (const row of rows) {
@@ -365,7 +375,6 @@ export default function BookingShell({ theme }: BookingShellProps) {
           newAvailability[row.table_id] = row.status;
         }
 
-        // Make sure the database returned a status for every active table.
         const missingTable = restaurant!.floorPlan.tables.find(
           (table) => !newAvailability[table.id]
         );
@@ -410,6 +419,29 @@ export default function BookingShell({ theme }: BookingShellProps) {
   ]);
 
   // ===========================================================================
+  // Hold countdown
+  // ===========================================================================
+
+  useEffect(() => {
+    if (!hold) return;
+
+    function updateCountdown() {
+      const difference = Math.max(
+        0,
+        Math.ceil((new Date(hold!.expiresAt).getTime() - Date.now()) / 1000)
+      );
+
+      setRemainingSeconds(difference);
+    }
+
+    updateCountdown();
+
+    const interval = window.setInterval(updateCountdown, 1000);
+
+    return () => window.clearInterval(interval);
+  }, [hold]);
+
+  // ===========================================================================
   // Derived table data
   // ===========================================================================
 
@@ -430,6 +462,20 @@ export default function BookingShell({ theme }: BookingShellProps) {
     0
   );
 
+  const guestCount =
+    bookingDetails.guests === "11+"
+      ? 11
+      : Number(bookingDetails.guests);
+
+  const formatCountdown = (seconds: number) => {
+    const minutes = Math.floor(seconds / 60);
+    const remaining = seconds % 60;
+
+    return `${String(minutes).padStart(2, "0")}:${String(
+      remaining
+    ).padStart(2, "0")}`;
+  };
+
   // ===========================================================================
   // Table selection
   // ===========================================================================
@@ -437,7 +483,6 @@ export default function BookingShell({ theme }: BookingShellProps) {
   function toggleTable(tableId: string) {
     const table = tables.find((item) => item.id === tableId);
 
-    // Never allow a held or reserved table to be selected.
     if (!table || table.status !== "available") return;
 
     setSelectedTableIds((current) =>
@@ -445,6 +490,102 @@ export default function BookingShell({ theme }: BookingShellProps) {
         ? current.filter((id) => id !== tableId)
         : [...current, tableId]
     );
+  }
+
+  // ===========================================================================
+  // Create temporary hold
+  // ===========================================================================
+
+  async function createHold(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+
+    if (!restaurant || creatingHold) return;
+
+    if (selectedTables.length === 0) {
+      setBookingError("Please select at least one available table.");
+      setStep("tables");
+      return;
+    }
+
+    if (totalCapacity < guestCount) {
+      setBookingError(
+        "The selected tables do not have enough seating capacity for your group."
+      );
+      setStep("tables");
+      return;
+    }
+
+    setCreatingHold(true);
+    setBookingError(null);
+
+    try {
+      const startsAt = restaurantDateTimeToISO(
+        bookingDetails.date,
+        bookingDetails.time,
+        restaurant.timezone
+      );
+
+      const { data, error: holdError } = await supabase.rpc(
+        "create_table_hold",
+        {
+          p_restaurant_slug: restaurant.slug,
+          p_starts_at: startsAt,
+          p_table_ids: selectedTables.map((table) => table.id),
+          p_customer_name: customerDetails.name.trim(),
+          p_customer_phone: customerDetails.phone.trim(),
+          p_customer_email: customerDetails.email.trim() || null,
+          p_guest_count: guestCount,
+          p_notes: customerDetails.notes.trim() || null,
+        }
+      );
+
+      if (holdError) throw holdError;
+
+      const result = (Array.isArray(data) ? data[0] : data) as
+        | HoldRow
+        | null;
+
+      if (!result?.reservation_id || !result?.hold_expires_at) {
+        throw new Error(
+          "The hold could not be confirmed. Please try again."
+        );
+      }
+
+      setHold({
+        reservationId: result.reservation_id,
+        expiresAt: result.hold_expires_at,
+      });
+
+      setStep("confirmation");
+    } catch (err) {
+      console.error("Failed to create table hold:", err);
+
+      setBookingError(
+        err instanceof Error
+          ? err.message
+          : "We couldn't hold those tables. Please try again."
+      );
+
+      // Return to the floor plan so the customer can choose again.
+      // This also triggers a fresh availability check.
+      setStep("tables");
+      setAvailabilityRetry((current) => current + 1);
+    } finally {
+      setCreatingHold(false);
+    }
+  }
+
+  // ===========================================================================
+  // Return to table selection after an expired hold
+  // ===========================================================================
+
+  function returnToTableSelection() {
+    setHold(null);
+    setRemainingSeconds(0);
+    setSelectedTableIds([]);
+    setBookingError(null);
+    setStep("tables");
+    setAvailabilityRetry((current) => current + 1);
   }
 
   // ===========================================================================
@@ -514,37 +655,46 @@ export default function BookingShell({ theme }: BookingShellProps) {
           </p>
         ) : (
           <>
-            <div className="mb-10 flex items-center gap-4 text-xs tracking-wider">
-              <span className="text-[var(--color-primary)]">
-                01 — DATE & TIME
-              </span>
+            {/* Progress indicator */}
 
-              <span className="h-px flex-1 bg-[var(--color-border)]" />
+            {step !== "confirmation" && (
+              <div className="mb-10 flex flex-wrap items-center gap-3 text-xs tracking-wider">
+                {[
+                  { id: "details", label: "01 — DATE & TIME" },
+                  { id: "tables", label: "02 — SELECT TABLE" },
+                  { id: "customer", label: "03 — YOUR DETAILS" },
+                ].map((item, index) => {
+                  const stepOrder = ["details", "tables", "customer"];
+                  const active = stepOrder.indexOf(step) >= index;
 
-              <span
-                className={
-                  step === "tables"
-                    ? "text-[var(--color-primary)]"
-                    : "text-[var(--color-muted)]"
-                }
-              >
-                02 — SELECT TABLE
-              </span>
+                  return (
+                    <span
+                      key={item.id}
+                      className={
+                        active
+                          ? "text-[var(--color-primary)]"
+                          : "text-[var(--color-muted)]"
+                      }
+                    >
+                      {item.label}
+                    </span>
+                  );
+                })}
+              </div>
+            )}
 
-              <span className="h-px flex-1 bg-[var(--color-border)]" />
+            {/* ============================================================= */}
+            {/* STEP 1 — DATE AND TIME                                       */}
+            {/* ============================================================= */}
 
-              <span className="text-[var(--color-muted)]">
-                03 — DETAILS
-              </span>
-            </div>
-
-            {step === "details" ? (
+            {step === "details" && (
               <form
                 onSubmit={(event) => {
                   event.preventDefault();
 
                   setSelectedTableIds([]);
                   setAvailability({});
+                  setBookingError(null);
                   setStep("tables");
                 }}
                 className="border border-[var(--color-border)] bg-[var(--color-surface)] p-6 md:p-10"
@@ -639,7 +789,13 @@ export default function BookingShell({ theme }: BookingShellProps) {
                   </button>
                 </div>
               </form>
-            ) : (
+            )}
+
+            {/* ============================================================= */}
+            {/* STEP 2 — TABLE SELECTION                                     */}
+            {/* ============================================================= */}
+
+            {step === "tables" && (
               <div className="border border-[var(--color-border)] bg-[var(--color-surface)] p-8 md:p-12">
                 <div className="mb-8 flex flex-wrap items-center justify-between gap-4">
                   <div>
@@ -664,6 +820,12 @@ export default function BookingShell({ theme }: BookingShellProps) {
                     ← Change details
                   </button>
                 </div>
+
+                {bookingError && (
+                  <div className="mb-6 border border-red-300 bg-red-50 p-4 text-sm text-red-700">
+                    {bookingError}
+                  </div>
+                )}
 
                 {availabilityLoading ? (
                   <div className="border border-[var(--color-border)] p-10 text-center">
@@ -750,6 +912,304 @@ export default function BookingShell({ theme }: BookingShellProps) {
                         </>
                       )}
                     </div>
+
+                    <div className="mt-8 flex justify-end border-t border-[var(--color-border)] pt-6">
+                      <button
+                        type="button"
+                        disabled={
+                          selectedTables.length === 0 ||
+                          totalCapacity < guestCount
+                        }
+                        onClick={() => {
+                          setBookingError(null);
+                          setStep("customer");
+                        }}
+                        className="bg-[var(--color-primary)] px-8 py-4 text-sm font-semibold text-[var(--color-on-primary)] transition-colors hover:bg-[var(--color-primary-hover)] disabled:cursor-not-allowed disabled:opacity-40"
+                      >
+                        Continue to Your Details →
+                      </button>
+                    </div>
+
+                    {totalCapacity < guestCount &&
+                      selectedTables.length > 0 && (
+                        <p className="mt-3 text-right text-sm text-red-600">
+                          Your selected tables need at least {guestCount} seats.
+                        </p>
+                      )}
+                  </>
+                )}
+              </div>
+            )}
+
+            {/* ============================================================= */}
+            {/* STEP 3 — CUSTOMER DETAILS                                    */}
+            {/* ============================================================= */}
+
+            {step === "customer" && (
+              <form
+                onSubmit={createHold}
+                className="border border-[var(--color-border)] bg-[var(--color-surface)] p-6 md:p-10"
+              >
+                <div className="mb-8 flex flex-wrap items-start justify-between gap-4">
+                  <div>
+                    <h2 className="mb-2 text-2xl text-[var(--color-foreground)]">
+                      Your Details
+                    </h2>
+
+                    <p className="text-sm text-[var(--color-muted)]">
+                      Tell us how to contact you about your reservation.
+                    </p>
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setBookingError(null);
+                      setStep("tables");
+                    }}
+                    className="text-sm text-[var(--color-primary)] hover:text-[var(--color-primary-hover)]"
+                  >
+                    ← Back to tables
+                  </button>
+                </div>
+
+                <div className="mb-8 border border-[var(--color-border)] p-5">
+                  <p className="text-xs tracking-wider text-[var(--color-muted)]">
+                    YOUR BOOKING
+                  </p>
+
+                  <p className="mt-3 text-sm text-[var(--color-foreground)]">
+                    {bookingDetails.date} · {bookingDetails.time}
+                  </p>
+
+                  <p className="mt-1 text-sm text-[var(--color-muted)]">
+                    {guestCount} guests ·{" "}
+                    {selectedTables.map((table) => table.name).join(", ")}
+                  </p>
+                </div>
+
+                {bookingError && (
+                  <div className="mb-6 border border-red-300 bg-red-50 p-4 text-sm text-red-700">
+                    {bookingError}
+                  </div>
+                )}
+
+                <div className="grid gap-6 md:grid-cols-2">
+                  <div className="space-y-2">
+                    <label
+                      htmlFor="customer-name"
+                      className="text-sm text-[var(--color-foreground)]"
+                    >
+                      Full name *
+                    </label>
+
+                    <input
+                      id="customer-name"
+                      type="text"
+                      required
+                      autoComplete="name"
+                      value={customerDetails.name}
+                      onChange={(event) =>
+                        setCustomerDetails({
+                          ...customerDetails,
+                          name: event.target.value,
+                        })
+                      }
+                      className="w-full border border-[var(--color-border)] bg-[var(--color-background)] px-4 py-4 text-sm text-[var(--color-foreground)] outline-none focus:border-[var(--color-primary)]"
+                      placeholder="Your full name"
+                    />
+                  </div>
+
+                  <div className="space-y-2">
+                    <label
+                      htmlFor="customer-phone"
+                      className="text-sm text-[var(--color-foreground)]"
+                    >
+                      Phone number *
+                    </label>
+
+                    <input
+                      id="customer-phone"
+                      type="tel"
+                      required
+                      autoComplete="tel"
+                      value={customerDetails.phone}
+                      onChange={(event) =>
+                        setCustomerDetails({
+                          ...customerDetails,
+                          phone: event.target.value,
+                        })
+                      }
+                      className="w-full border border-[var(--color-border)] bg-[var(--color-background)] px-4 py-4 text-sm text-[var(--color-foreground)] outline-none focus:border-[var(--color-primary)]"
+                      placeholder="+263..."
+                    />
+                  </div>
+
+                  <div className="space-y-2 md:col-span-2">
+                    <label
+                      htmlFor="customer-email"
+                      className="text-sm text-[var(--color-foreground)]"
+                    >
+                      Email address (optional)
+                    </label>
+
+                    <input
+                      id="customer-email"
+                      type="email"
+                      autoComplete="email"
+                      value={customerDetails.email}
+                      onChange={(event) =>
+                        setCustomerDetails({
+                          ...customerDetails,
+                          email: event.target.value,
+                        })
+                      }
+                      className="w-full border border-[var(--color-border)] bg-[var(--color-background)] px-4 py-4 text-sm text-[var(--color-foreground)] outline-none focus:border-[var(--color-primary)]"
+                      placeholder="you@example.com"
+                    />
+                  </div>
+
+                  <div className="space-y-2 md:col-span-2">
+                    <label
+                      htmlFor="customer-notes"
+                      className="text-sm text-[var(--color-foreground)]"
+                    >
+                      Special requests (optional)
+                    </label>
+
+                    <textarea
+                      id="customer-notes"
+                      rows={4}
+                      value={customerDetails.notes}
+                      onChange={(event) =>
+                        setCustomerDetails({
+                          ...customerDetails,
+                          notes: event.target.value,
+                        })
+                      }
+                      className="w-full resize-y border border-[var(--color-border)] bg-[var(--color-background)] px-4 py-4 text-sm text-[var(--color-foreground)] outline-none focus:border-[var(--color-primary)]"
+                      placeholder="Let us know if you have any special requests..."
+                    />
+                  </div>
+                </div>
+
+                <div className="mt-8 border-t border-[var(--color-border)] pt-6">
+                  <p className="text-sm leading-6 text-[var(--color-muted)]">
+                    Your selected tables will only be held once you submit
+                    this form. The temporary hold will last{" "}
+                    {restaurant.holdDurationMinutes} minutes.
+                  </p>
+
+                  <div className="mt-8 flex justify-end">
+                    <button
+                      type="submit"
+                      disabled={creatingHold}
+                      className="bg-[var(--color-primary)] px-8 py-4 text-sm font-semibold text-[var(--color-on-primary)] transition-colors hover:bg-[var(--color-primary-hover)] disabled:cursor-wait disabled:opacity-50"
+                    >
+                      {creatingHold
+                        ? "Securing your tables..."
+                        : "Secure My Tables →"}
+                    </button>
+                  </div>
+                </div>
+              </form>
+            )}
+
+            {/* ============================================================= */}
+            {/* STEP 4 — TEMPORARY HOLD CONFIRMATION                          */}
+            {/* ============================================================= */}
+
+            {step === "confirmation" && hold && (
+              <div className="mx-auto max-w-2xl border border-[var(--color-border)] bg-[var(--color-surface)] p-8 text-center md:p-12">
+                {remainingSeconds > 0 ? (
+                  <>
+                    <p className="text-xs tracking-[0.3em] text-[var(--color-primary)]">
+                      TEMPORARY HOLD CREATED
+                    </p>
+
+                    <h2 className="mt-5 text-3xl text-[var(--color-foreground)] md:text-4xl">
+                      Your tables are being held.
+                    </h2>
+
+                    <p className="mx-auto mt-4 max-w-md text-sm leading-7 text-[var(--color-muted)]">
+                      We've temporarily secured your selected tables. You
+                      have until the timer expires to complete the next step
+                      of your reservation.
+                    </p>
+
+                    <div className="my-10 border-y border-[var(--color-border)] py-8">
+                      <p className="text-xs tracking-wider text-[var(--color-muted)]">
+                        TIME REMAINING
+                      </p>
+
+                      <p className="mt-3 font-mono text-5xl tabular-nums text-[var(--color-primary)]">
+                        {formatCountdown(remainingSeconds)}
+                      </p>
+
+                      <p className="mt-3 text-xs text-[var(--color-muted)]">
+                        Your hold expires automatically when this timer
+                        reaches zero.
+                      </p>
+                    </div>
+
+                    <div className="space-y-2 text-sm text-[var(--color-foreground)]">
+                      <p>
+                        <span className="text-[var(--color-muted)]">
+                          Reservation reference:
+                        </span>{" "}
+                        {hold.reservationId}
+                      </p>
+
+                      <p>
+                        <span className="text-[var(--color-muted)]">
+                          Name:
+                        </span>{" "}
+                        {customerDetails.name}
+                      </p>
+
+                      <p>
+                        <span className="text-[var(--color-muted)]">
+                          Visit:
+                        </span>{" "}
+                        {bookingDetails.date} at {bookingDetails.time}
+                      </p>
+
+                      <p>
+                        <span className="text-[var(--color-muted)]">
+                          Tables:
+                        </span>{" "}
+                        {selectedTables.map((table) => table.name).join(", ")}
+                      </p>
+                    </div>
+
+                    <p className="mt-8 text-xs leading-6 text-[var(--color-muted)]">
+                      This is a temporary hold, not yet a confirmed
+                      reservation.
+                    </p>
+                  </>
+                ) : (
+                  <>
+                    <p className="text-xs tracking-[0.3em] text-red-600">
+                      HOLD EXPIRED
+                    </p>
+
+                    <h2 className="mt-5 text-3xl text-[var(--color-foreground)]">
+                      Your hold has expired.
+                    </h2>
+
+                    <p className="mt-4 text-sm leading-7 text-[var(--color-muted)]">
+                      The temporary hold period has ended. Your tables may
+                      now be available to other customers. You can check
+                      availability and try again.
+                    </p>
+
+                    <button
+                      type="button"
+                      onClick={returnToTableSelection}
+                      className="mt-8 bg-[var(--color-primary)] px-8 py-4 text-sm font-semibold text-[var(--color-on-primary)] hover:bg-[var(--color-primary-hover)]"
+                    >
+                      Check Availability Again →
+                    </button>
                   </>
                 )}
               </div>
